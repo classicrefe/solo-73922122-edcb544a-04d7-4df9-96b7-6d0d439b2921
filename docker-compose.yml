@@ -1,7 +1,7 @@
 services:
   roster-check-api:
     build: .
-    image: roster-check-api:1.0.0
+    image: roster-check-api:1.1.0
     container_name: roster-check-api
     ports:
       - "8000:8000"

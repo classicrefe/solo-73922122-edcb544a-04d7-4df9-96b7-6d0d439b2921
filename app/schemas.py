@@ -14,7 +14,9 @@ MIN_PLAYERS = 5
 LINEUP_SIZE = 5
 MAX_SEGMENTS = 16
 
-VerdictStatus = Literal["guaranteed", "possible", "impossible", "infeasible_record"]
+VerdictStatus = Literal[
+    "guaranteed", "possible", "impossible", "infeasible_record", "undetermined"
+]
 
 
 class SegmentInput(BaseModel):
@@ -131,16 +133,29 @@ class NetBounds(BaseModel):
 
 
 class CheckResponse(BaseModel):
+    """核对响应。
+
+    数值字段只在已证实时给出：
+    - `shared_seconds_min/max`：对应优化 run 达到 OPTIMAL（已证实极值）才出具；
+    - 两个净胜分范围：两端都证实为最优才出具，且各附一套逐段见证名单；
+    - `feasible`：True=已证实存在可行名单，False=已证实无解，None=未判定。
+    """
+
     status: VerdictStatus
     status_label_zh: str
     target_lineup: list[int]
     minimum_seconds: int
-    feasible: bool
+    feasible: bool | None = None
     shared_seconds_min: int | None = None
     shared_seconds_max: int | None = None
     bounds_proven_optimal: bool = True
     net_bounds_all_feasible: NetBounds | None = None
     net_bounds_among_qualifying: NetBounds | None = None
+    qualifying_witness: WitnessRoster | None = None
+    non_qualifying_witness: WitnessRoster | None = None
+    evidence: list[str] = Field(
+        default_factory=list, description="已证实事实与未判定事项的逐条说明"
+    )
     verification: str | None = None
     verification_errors: list[str] = Field(default_factory=list)
     conflicts: list[dict] = Field(default_factory=list)

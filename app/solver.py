@@ -10,9 +10,16 @@
   z[t]：目标五人是否在片段 t 同场；
   S   ：目标五人同场总秒数；
   N   ：目标五人同场片段的得失分之和（净胜分）。
+
+超时口径：
+  - 每个求解 run 受 SOLVER_TIME_LIMIT_SECONDS 限制，并共享请求级总预算 deadline；
+  - 预算耗尽的 run 记为 SKIPPED（不真正调用求解器）；CP-SAT 自身超时返回 UNKNOWN；
+  - 只有 OPTIMAL 的目标值才是已证实极值，只有 INFEASIBLE 才是已证实无解；
+    FEASIBLE / UNKNOWN / SKIPPED 都只能提供见证名单，不能作为极值或无解的证据。
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from ortools.sat.python import cp_model
@@ -20,11 +27,14 @@ from ortools.sat.python import cp_model
 from .schemas import LINEUP_SIZE, RosterCheckRequest
 
 SOLVER_TIME_LIMIT_SECONDS = 30.0
+# 单次请求全部求解 run 共享的总预算（秒）：超过后剩余 run 直接标记 SKIPPED，
+# 由接口层返回已证实的部分结果，而不是无限期空转。
+TOTAL_TIME_BUDGET_SECONDS = 120.0
 
 
 @dataclass
 class SolveOutcome:
-    status_name: str  # OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN
+    status_name: str  # OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN / SKIPPED
     assignments: list[list[int]] | None = None
     objective: int | None = None
 
@@ -46,7 +56,7 @@ class Diagnosis:
 
 
 class RosterCpSolver:
-    def __init__(self, req: RosterCheckRequest) -> None:
+    def __init__(self, req: RosterCheckRequest, *, deadline: float | None = None) -> None:
         self.req = req
         self.players = list(req.players)
         self.p_index = {p: i for i, p in enumerate(self.players)}
@@ -61,6 +71,9 @@ class RosterCpSolver:
         self.official = {p: req.official_seconds[p] for p in self.players}
         self.total_seconds = sum(self.durations)
         self.runs = 0
+        self.skipped_runs = 0
+        # 请求级总预算的截止时间（time.monotonic() 时钟）；None 表示不设总预算
+        self.deadline = deadline
 
     # ------------------------------------------------------------------ #
     # 求解前的静态冲突诊断（不依赖求解器，给出精确定位）
@@ -148,6 +161,7 @@ class RosterCpSolver:
         *,
         use_official_totals: bool = True,
         shared_seconds_lower_bound: int | None = None,
+        shared_seconds_upper_bound: int | None = None,
     ) -> tuple[cp_model.CpModel, dict, dict, dict]:
         """构建基础模型，返回 model 与变量字典。"""
         model = cp_model.CpModel()
@@ -207,8 +221,20 @@ class RosterCpSolver:
                 sum(self.durations[t] * z[t] for t in range(self.T))
                 >= shared_seconds_lower_bound
             )
+        if shared_seconds_upper_bound is not None:
+            model.add(
+                sum(self.durations[t] * z[t] for t in range(self.T))
+                <= shared_seconds_upper_bound
+            )
 
         return model, x, b, z
+
+    def _remaining_budget(self) -> float:
+        """本次 run 可用的时间预算：单 run 上限与请求级剩余预算的较小值。"""
+        budget = SOLVER_TIME_LIMIT_SECONDS
+        if self.deadline is not None:
+            budget = min(budget, self.deadline - time.monotonic())
+        return budget
 
     def _solve(
         self,
@@ -217,8 +243,13 @@ class RosterCpSolver:
         maximize: bool = True,
         x: dict[tuple[int, int], cp_model.IntVar] | None = None,
     ) -> SolveOutcome:
+        budget = self._remaining_budget()
+        if budget <= 0:
+            # 请求级总预算已耗尽：不调用求解器，明确标记为“跳过”
+            self.skipped_runs += 1
+            return SolveOutcome(status_name="SKIPPED")
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = SOLVER_TIME_LIMIT_SECONDS
+        solver.parameters.max_time_in_seconds = budget
         solver.parameters.num_workers = 8
         if objective_var is not None:
             if maximize:
@@ -255,10 +286,15 @@ class RosterCpSolver:
     # 对外的分阶段求解
     # ------------------------------------------------------------------ #
     def feasible(
-        self, *, shared_seconds_lower_bound: int | None = None
+        self,
+        *,
+        shared_seconds_lower_bound: int | None = None,
+        shared_seconds_upper_bound: int | None = None,
     ) -> SolveOutcome:
+        """纯可行性探测：可附加同场秒数上/下界，用于达标 / 不达标名单的存在性证明。"""
         model, x, _, _ = self._build_base_model(
-            shared_seconds_lower_bound=shared_seconds_lower_bound
+            shared_seconds_lower_bound=shared_seconds_lower_bound,
+            shared_seconds_upper_bound=shared_seconds_upper_bound,
         )
         return self._solve(model, None, x=x)
 
@@ -280,24 +316,36 @@ class RosterCpSolver:
         return self._solve(model, n_var, maximize=maximize, x=x)
 
     # ------------------------------------------------------------------ #
-    # 基础模型不可行时的深入诊断
+    # 基础模型被证实不可行后的深入诊断
     # ------------------------------------------------------------------ #
     def diagnose_infeasibility(self) -> list[dict]:
-        """基础约束不可行时，定位冲突来源。"""
+        """基础约束已被证实不可行时，定位冲突来源。
+
+        诊断过程中的求解超时不会让结论“升级”：只有求解器证实 INFEASIBLE 才报
+        结构性冲突，只有 OPTIMAL 的可达区间才用于定位超界球员；证据不足时如实
+        返回 DIAGNOSIS_INCONCLUSIVE。
+        """
         diag = Diagnosis()
 
         # A. 去掉官方秒数约束，检查结构（5 人 / 确认 / 换人）本身是否可行
         structural_model, x_struct, _, _ = self._build_base_model(use_official_totals=False)
         outcome = self._solve(structural_model, None, x=x_struct)
-        if outcome.status_name not in ("OPTIMAL", "FEASIBLE"):
+        if outcome.status_name == "INFEASIBLE":
             diag.add(
                 "STRUCTURAL_INFEASIBLE",
                 "即便忽略官方累计秒数，每段五人、确认球员与换人记录仍无法同时满足",
             )
             return diag.conflicts
+        if outcome.status_name not in ("OPTIMAL", "FEASIBLE"):
+            diag.add(
+                "DIAGNOSIS_INCONCLUSIVE",
+                "已证实完整约束不可行，但结构松弛模型求解超时，无法在时限内进一步定位冲突",
+            )
+            return diag.conflicts
 
-        # B. 结构可行：逐人求在结构约束下的可达秒数区间，定位超界球员
+        # B. 结构可行：逐人求在结构约束下的可达秒数区间（须证实最优），定位超界球员
         out_of_range: list[dict] = []
+        inconclusive = False
         for pi, p in enumerate(self.players):
             lo_model, x_lo, _, _ = self._build_base_model(use_official_totals=False)
             t_var = lo_model.new_int_var(0, self.total_seconds, f"sec_{p}")
@@ -312,7 +360,9 @@ class RosterCpSolver:
                 t_var3 == sum(self.durations[t] * x_hi[t, pi] for t in range(self.T))
             )
             hi = self._solve(hi_model, t_var3, maximize=True, x=x_hi)
-            if lo.objective is None or hi.objective is None:
+            if lo.status_name != "OPTIMAL" or hi.status_name != "OPTIMAL":
+                # 未证实最优的区间不能作为诊断依据
+                inconclusive = True
                 continue
             if not (lo.objective <= self.official[p] <= hi.objective):
                 out_of_range.append(
@@ -331,6 +381,14 @@ class RosterCpSolver:
 
         if out_of_range:
             diag.conflicts.extend(out_of_range)
+            return diag.conflicts
+
+        if inconclusive:
+            diag.add(
+                "DIAGNOSIS_INCONCLUSIVE",
+                "已证实完整约束不可行；部分球员的可达秒数区间未在时限内证实，"
+                "无法进一步定位联合冲突",
+            )
             return diag.conflicts
 
         diag.add(
